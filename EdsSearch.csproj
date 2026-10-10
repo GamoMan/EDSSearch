@@ -8,6 +8,7 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.31.0" />
+    <PackageReference Include="Microsoft.ML.OnnxRuntimeGenAI" Version="0.17.1" />
     <PackageReference Include="Microsoft.ML.Tokenizers" Version="2.0.0" />
     <PackageReference Include="NRedisStack" Version="1.8.0" />
   </ItemGroup>
@@ -15,6 +16,7 @@
   <!-- run once:
        dotnet add package NRedisStack
        dotnet add package Microsoft.ML.OnnxRuntime
-       dotnet add package Microsoft.ML.Tokenizers -->
+       dotnet add package Microsoft.ML.Tokenizers
+       dotnet add package Microsoft.ML.OnnxRuntimeGenAI      (local LLM for the answer; optional) -->
 
 </Project>

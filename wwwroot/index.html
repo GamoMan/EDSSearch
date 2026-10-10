@@ -39,6 +39,7 @@
   .answer.stale { opacity: .5; }
   .answer h2 { margin: 0 0 6px; font-size: 13px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
   .answer p { margin: 0; }
+  .answer .note { margin-top: 10px; font-size: 12px; color: var(--muted); }
   .cite { display: inline-block; min-width: 18px; padding: 0 5px; margin-left: 2px; border-radius: 9px; font-size: 12px;
           line-height: 18px; text-align: center; text-decoration: none; background: var(--accent-soft); color: var(--accent); }
   .cite:hover { background: var(--accent); color: #fff; }
@@ -71,6 +72,7 @@
   <section id="answer" class="answer" hidden aria-live="polite">
     <h2>Summary</h2>
     <p id="answerText"></p>
+    <p id="answerNote" class="note" hidden>สร้างโดย AI อาจไม่ถูกต้อง โปรดตรวจสอบจากแหล่งอ้างอิง / AI-generated, please verify with the sources.</p>
   </section>
   <div id="results"></div>
 
@@ -118,19 +120,38 @@ async function search() {
     </article>`).join("") : `<p class="path">ไม่พบผลลัพธ์ / No results</p>`;
   if (!hits.length) { $("answer").hidden = true; return; }
   // results show immediately; the summary follows
-  summarize(q, my);
+  //summarize(q, my);
 }
 
-async function summarize(q, my) {
-  const r = await fetch(`/api/summary?q=${encodeURIComponent(q)}&mode=${$("mode").value}&lang=${$("lang").value}`);
-  const s = r.ok ? await r.json() : null;
-  if (my !== seq) return;
-  if (!s || !s.sentences || !s.sentences.length) { $("answer").hidden = true; return; }
-  $("answerText").innerHTML = s.sentences
-    .map(x => `${esc(x.text)}<a class="cite" href="#r${x.source}" title="Source ${x.source}">${x.source}</a>`)
-    .join(" ");
+let es = null;
+
+// the answer streams in (Server-Sent Events); [n] markers become links to result n
+function renderAnswer(raw) {
+  $("answerText").innerHTML = esc(raw)
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/\[(\d+)\]/g, '<a class="cite" href="#r$1" title="Source $1">$1</a>')
+    .replace(/\n/g, "<br>");
   $("answer").hidden = false;
   $("answer").classList.remove("stale");
+}
+
+function summarize(q, my) {
+  if (es) es.close();
+  let raw = "", llm = false;
+  $("answerText").textContent = "กำลังสรุป… / Summarizing…";
+  $("answerNote").hidden = true;
+  $("answer").hidden = false;
+  $("answer").classList.add("stale");
+  es = new EventSource(`/api/summary/stream?q=${encodeURIComponent(q)}&mode=${$("mode").value}&lang=${$("lang").value}`);
+  const stop = () => { es.close(); if (!raw.trim()) $("answer").hidden = true; else $("answerNote").hidden = !llm; };
+  es.onmessage = ev => {
+    if (my !== seq) { es.close(); return; }          // a newer search replaced this one
+    const m = JSON.parse(ev.data);
+    if (m.type === "meta") llm = m.mode === "llm";
+    else if (m.type === "token") { raw += m.text; renderAnswer(raw); }
+    else stop();                                     // done | error
+  };
+  es.onerror = stop;                                 // also fires when the stream ends: no auto-reconnect
 }
 
 // search only when the user submits: Enter key or the Search button (not while typing)

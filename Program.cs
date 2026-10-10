@@ -34,6 +34,13 @@ app.Services.GetRequiredService<SearchService>().Init();
 app.UseDefaultFiles();
 app.UseStaticFiles();
 
+// tell the developer straight away if the web page cannot be found (a missing wwwroot gives a blank 404 page)
+var indexFile = System.IO.Path.Combine(app.Environment.WebRootPath ?? "(no wwwroot folder)", "index.html");
+app.Logger.LogInformation("Web page: {File} -> {State}", indexFile, File.Exists(indexFile) ? "found" : "MISSING");
+app.MapGet("/", () => Results.Text(
+    $"index.html not found.\nExpected at: {indexFile}\nContent root: {app.Environment.ContentRootPath}\n" +
+    "Put wwwroot/index.html next to Program.cs and run dotnet run from that folder.", "text/plain"));
+
 // Optional API key for POST (reindex / update)
 app.Use(async (ctx, next) =>
 {
@@ -59,9 +66,31 @@ app.MapPost("/api/update", (SearchService s, UpdateRequest? req, bool? wait) =>
     Guard(() => s.UpdateAsync(req?.Paths, req?.Deep ?? false, wait ?? false), (wait ?? false) ? 200 : 202));
 app.MapGet("/api/progress", (SearchService s) => Results.Ok(s.Progress()));
 app.MapGet("/api/search", (SearchService s, string q, int? k, string? mode, string? lang, bool? summary) =>
-    Results.Ok(s.Search(q, Math.Clamp(k ?? 10, 1, 50), mode ?? "vector", lang, summary ?? true)));
+    Results.Ok(s.Search(q, Math.Clamp(k ?? 10, 1, 50), mode ?? "vector", lang, summary ?? false)));   // summary=true -> extractive summary inside the JSON
+// whole answer as JSON (LLM if enabled and loaded, otherwise extractive) - waits until generation has finished
 app.MapGet("/api/summary", (SearchService s, string q, string? mode, string? lang) =>
     Results.Json(s.SummaryFor(q, mode ?? "vector", lang)));
+
+// the same answer streamed token by token (Server-Sent Events) - used by the web page
+app.MapGet("/api/summary/stream", async (HttpContext ctx, SearchService s, string q, string? mode, string? lang) =>
+{
+    ctx.Response.Headers.ContentType = "text/event-stream";
+    ctx.Response.Headers.CacheControl = "no-cache";
+    async Task Send(object o)
+    {
+        await ctx.Response.WriteAsync("data: " + JsonSerializer.Serialize(o) + "\n\n", ctx.RequestAborted);
+        await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+    }
+    try
+    {
+        await Send(new { type = "meta", mode = s.LlmEnabled ? "llm" : "extractive" });
+        foreach (var piece in s.StreamAnswer(q, mode ?? "vector", lang, ctx.RequestAborted))
+            await Send(new { type = "token", text = piece });
+        await Send(new { type = "done" });
+    }
+    catch (OperationCanceledException) { }          // browser closed / started a new search
+    catch (Exception e) { await Send(new { type = "error", message = e.Message }); }
+});
 app.MapGet("/api/status", (SearchService s) => Results.Ok(s.Status()));
 app.MapGet("/api/embed-test", (SearchService s, string text) => Results.Ok(s.EmbedTest(text)));
 
@@ -87,6 +116,7 @@ public class EdsOptions
     public Weights Weights { get; set; } = new();
     public EmbeddingOptions Embedding { get; set; } = new();
     public SummaryOptions Summary { get; set; } = new();
+    public LlmOptions Llm { get; set; } = new();
 }
 public record UpdateRequest(string[]? Paths, bool Deep = false);
 public record Entry(string Path, string Title, string Date, string Description, string Image, string Keywords, string Robots, string Content);
@@ -103,6 +133,7 @@ public class SearchService
     readonly ILogger<SearchService> log;
     readonly SemaphoreSlim gate = new(1, 1);
     readonly OnnxEmbedder? emb;          // null = hashed TF-IDF mode
+    readonly LlmSummarizer? llm;         // null = extractive summary only
     int[] df;
     int n;
 
@@ -118,6 +149,12 @@ public class SearchService
         this.o = o; this.http = http; this.log = log; db = mux.GetDatabase(); df = new int[o.Dim];
         emb = o.Embedding.Provider.Equals("onnx", StringComparison.OrdinalIgnoreCase)
             ? new OnnxEmbedder(o.Embedding, log) : null;
+        if (o.Llm.Enabled)
+        {
+            try { llm = new LlmSummarizer(o.Llm, log); }
+            catch (Exception e)   // missing model must not stop search: fall back to the extractive summary
+            { log.LogWarning("LLM summary disabled: {Msg}", e.Message); }
+        }
     }
 
     int VecDim => emb?.Dim ?? o.Dim;
@@ -345,6 +382,7 @@ public class SearchService
     async Task<Doc?> ToDocAsync(Entry e)
     {
         if (e.Robots.Contains("noindex", StringComparison.OrdinalIgnoreCase)) return null;
+        if (Regex.IsMatch(e.Title, @"^\s*404(\D|$)")) return null;     // error pages ("404", "404 - Page not found"): not indexed, page not even fetched
         string content = e.Content;
         try { content = HtmlToText(await http.GetStringAsync(PlainUrl(e.Path))); }
         catch (HttpRequestException) { /* fall back to the content column */ }
@@ -574,8 +612,11 @@ public class SearchService
     }
 
     // same top results as /api/search, so the [n] citations match the result numbers
-    public object? SummaryFor(string q, string mode, string? lang) =>
-        Summarize(q, SearchHits(q, o.Summary.TopDocs, mode, lang));
+    public object? SummaryFor(string q, string mode, string? lang)
+    {
+        var text = string.Concat(StreamAnswer(q, mode, lang, CancellationToken.None));
+        return text.Length == 0 ? null : new { mode = llm is null ? "llm-disabled (extractive)" : "llm", text };
+    }
 
     // ---------- extractive summary: no generation, only sentences that exist on the pages, each with its source
     record Cand(int Doc, int Pos, string Text);
@@ -631,20 +672,27 @@ public class SearchService
         return na > 0 && nb > 0 ? dot / Math.Sqrt(na * nb) : 0;
     }
 
-    object? Summarize(string q, List<Hit> hits)
+    public record ExtractiveSummary(string text, List<SummarySentence> sentences, List<int> sources);
+
+    // best passages for the query from the top pages: sentences, plus page descriptions when `loose`
+    // (descriptions are only context for the LLM - the extractive summary never quotes them)
+    List<Cand> Pick(string q, List<Hit> hits, int max, bool loose)
     {
         var so = o.Summary;
         var cands = new List<Cand>();
         for (int i = 0; i < Math.Min(so.TopDocs, hits.Count); i++)
         {
             var key = Pre + hits[i].path;
-            var desc = ((string?)db.HashGet(key, "description") ?? "").Trim();
-            if (desc.Length >= 25) cands.Add(new Cand(i, -1, desc));
+            if (loose)
+            {
+                var desc = ((string?)db.HashGet(key, "description") ?? "").Trim();
+                if (desc.Length >= 25) cands.Add(new Cand(i, -1, desc));
+            }
             int pos = 0;
             foreach (var sent in Sentences((string?)db.HashGet(key, "content") ?? "").Take(so.PerDoc))
                 cands.Add(new Cand(i, pos++, sent));
         }
-        if (cands.Count == 0) return null;
+        if (cands.Count == 0) return new List<Cand>();
 
         double[] sims;
         float[][]? vecs = null;
@@ -663,24 +711,70 @@ public class SearchService
         double Score(int i) => sims[i] * (1 - 0.04 * cands[i].Doc);      // small bonus for higher-ranked pages
         var order = Enumerable.Range(0, cands.Count).OrderByDescending(Score).ToList();
         double best = Score(order[0]);
-        if (best <= 0) return null;
-        double floor = emb is null ? best * 0.75 : best - 0.06;          // keep only sentences close to the best one
+        if (best <= 0) return new List<Cand>();
+        double floor = loose ? (emb is null ? best * 0.5 : best - 0.10)
+                             : (emb is null ? best * 0.75 : best - 0.06);   // keep passages close to the best one
 
         var picked = new List<int>();
         foreach (var i in order)
         {
-            if (picked.Count >= so.MaxSentences || Score(i) < floor) break;
+            if (picked.Count >= max || Score(i) < floor) break;
             bool dup = picked.Any(j => cands[j].Text == cands[i].Text || (vecs is not null && Dot(vecs[i], vecs[j]) > 0.93));
             if (!dup) picked.Add(i);
         }
+        return picked.OrderBy(i => cands[i].Doc).ThenBy(i => cands[i].Pos).Select(i => cands[i]).ToList();   // reading order
+    }
 
-        var sentences = picked.OrderBy(i => cands[i].Doc).ThenBy(i => cands[i].Pos)     // reading order
-            .Select(i => new SummarySentence(Clip(cands[i].Text, 320), cands[i].Doc + 1)).ToList();
-        return new
-        {
-            text = string.Join(" ", sentences.Select(x => $"{x.text} [{x.source}]")),
+    ExtractiveSummary? Summarize(string q, List<Hit> hits)
+    {
+        var picked = Pick(q, hits, o.Summary.MaxSentences, false);
+        if (picked.Count == 0) return null;
+        var sentences = picked.Select(c => new SummarySentence(Clip(c.Text, 320), c.Doc + 1)).ToList();
+        return new ExtractiveSummary(
+            string.Join(" ", sentences.Select(x => $"{x.text} [{x.source}]")),
             sentences,
-            sources = sentences.Select(x => x.source).Distinct().ToList()
-        };
+            sentences.Select(x => x.source).Distinct().ToList());
+    }
+
+    // ---------- LLM answer: writes a new, short answer from the best passages, with [n] citations
+    public bool LlmEnabled => llm is not null;
+
+    string BuildPrompt(string q, List<Hit> hits, List<Cand> evidence)
+    {
+        var sources = new StringBuilder();
+        foreach (var g in evidence.GroupBy(c => c.Doc))
+        {
+            sources.Append($"[{g.Key + 1}] {hits[g.Key].title}\n");
+            foreach (var c in g) sources.Append("- ").Append(Clip(c.Text, 400)).Append('\n');
+            sources.Append('\n');
+        }
+        bool thai = q.Any(ch => ch >= '\u0E00' && ch <= '\u0E7F');
+        var system =
+            "You are the search assistant of a bank website. Answer the question using ONLY the numbered sources provided. " +
+            $"Write a short, natural answer in {(thai ? "Thai" : "English")}: 2-4 sentences, or a few short bullet points when listing steps or options. " +
+            "Explain in your own words instead of copying sentences. " +
+            "After each statement, add the number of the source that supports it in square brackets, like [1] or [2]. " +
+            "Never invent facts, numbers, rates or fees that are not in the sources. " +
+            "If the sources do not answer the question, say so briefly.";
+        return llm!.Format(system, $"Sources:\n{sources}\nQuestion: {q}");
+    }
+
+    // pieces of the answer as they are produced; extractive fallback returns the whole text in one piece
+    public IEnumerable<string> StreamAnswer(string q, string mode, string? lang, CancellationToken ct)
+    {
+        var hits = SearchHits(q, o.Summary.TopDocs, mode, lang);
+        if (hits.Count == 0) yield break;
+
+        if (llm is null)
+        {
+            var s = Summarize(q, hits);
+            if (s is not null) yield return s.text;
+            yield break;
+        }
+
+        var evidence = Pick(q, hits, o.Llm.Evidence, true);
+        if (evidence.Count == 0) yield break;
+        foreach (var piece in llm.Generate(BuildPrompt(q, hits, evidence), ct))
+            yield return piece;
     }
 }

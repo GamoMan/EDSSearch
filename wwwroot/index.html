@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ค้นหา / Search</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #fff; --ink: #1b2430; --muted: #6b7684;
+    --line: #dde1e7; --accent: #0b4f9c; --accent-soft: #e6eef8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #12161c; --panel: #1a2029; --ink: #e8ecf1; --muted: #93a0b0;
+            --line: #2b3441; --accent: #6cb0ff; --accent-soft: #1d2b3d; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 16px/1.55 "Sarabun", "Noto Sans Thai", "Segoe UI", system-ui, sans-serif; }
+  main { max-width: 820px; margin: 0 auto; padding: 32px 16px 64px; }
+  .bar { display: flex; gap: 8px; }
+  input[type=search] { flex: 1; font: inherit; padding: 12px 14px; border: 1px solid var(--line);
+         border-radius: 6px; background: var(--panel); color: var(--ink); }
+  select, button, input[type=password] { font: inherit; padding: 10px 14px; border: 1px solid var(--line);
+         border-radius: 6px; background: var(--panel); color: var(--ink); }
+  button { cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  #meta { color: var(--muted); font-size: 14px; margin: 14px 0 6px; min-height: 1.4em; }
+  .hit { display: flex; gap: 14px; padding: 16px 0; border-bottom: 1px solid var(--line); }
+  .hit img { width: 96px; height: 64px; object-fit: cover; border-radius: 4px; background: var(--accent-soft); flex: none; }
+  .hit h3 { margin: 0 0 2px; font-size: 18px; }
+  .hit a { color: var(--accent); text-decoration: none; }
+  .hit a:hover { text-decoration: underline; }
+  .path { color: var(--muted); font-size: 13px; word-break: break-all; }
+  .hit p { margin: 6px 0 0; }
+  .score { margin-left: auto; color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .answer { margin: 18px 0 8px; padding: 14px 16px; background: var(--panel); border: 1px solid var(--line);
+            border-left: 4px solid var(--accent); border-radius: 6px; transition: opacity .15s; }
+  .answer.stale { opacity: .5; }
+  .answer h2 { margin: 0 0 6px; font-size: 13px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+  .answer p { margin: 0; }
+  .cite { display: inline-block; min-width: 18px; padding: 0 5px; margin-left: 2px; border-radius: 9px; font-size: 12px;
+          line-height: 18px; text-align: center; text-decoration: none; background: var(--accent-soft); color: var(--accent); }
+  .cite:hover { background: var(--accent); color: #fff; }
+  .num { flex: none; width: 22px; height: 22px; border-radius: 11px; background: var(--accent-soft); color: var(--accent);
+         font-size: 12px; line-height: 22px; text-align: center; margin-top: 2px; }
+  .hit:target { background: var(--accent-soft); }
+  details { margin-top: 40px; border-top: 1px solid var(--line); padding-top: 12px; }
+  summary { cursor: pointer; color: var(--muted); }
+  .admin { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; align-items: center; }
+  progress { width: 100%; height: 8px; margin-top: 10px; accent-color: var(--accent); }
+  #log { margin-top: 10px; font: 13px/1.5 ui-monospace, Consolas, monospace; white-space: pre-wrap; color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <div class="bar">
+    <input id="q" type="search" placeholder="พิมพ์แล้วกด Enter / Type and press Enter" autofocus aria-label="Search">
+    <button id="go" class="primary" type="button">Search</button>
+    <select id="lang" aria-label="Language">
+      <option value="">EN + TH</option>
+      <option value="en">English</option>
+      <option value="th">ไทย</option>
+    </select>
+    <select id="mode" aria-label="Mode">
+      <option value="vector">Vector</option>
+      <option value="text">Full-text</option>
+    </select>
+  </div>
+  <div id="meta"></div>
+  <section id="answer" class="answer" hidden aria-live="polite">
+    <h2>Summary</h2>
+    <p id="answerText"></p>
+  </section>
+  <div id="results"></div>
+
+  <details>
+    <summary>Index admin</summary>
+    <div class="admin">
+      <input id="key" type="password" placeholder="API key (if set)" aria-label="API key">
+      <button id="update" class="primary">Update index</button>
+      <button id="deep">Update (deep check)</button>
+      <button id="reindex">Full reindex</button>
+      <button id="status">Status</button>
+    </div>
+    <progress id="bar" max="100" value="0" hidden></progress>
+    <div id="log"></div>
+  </details>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let seq = 0;
+
+function esc(s) { return (s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])); }
+
+async function search() {
+  const q = $("q").value.trim();
+  const my = ++seq;
+  if (!q) { $("results").innerHTML = ""; $("meta").textContent = ""; $("answer").hidden = true; return; }
+  $("answer").classList.add("stale");
+  const t0 = performance.now();
+  const r = await fetch(`/api/search?q=${encodeURIComponent(q)}&k=15&mode=${$("mode").value}&lang=${$("lang").value}&summary=false`);
+  const data = await r.json();
+  if (my !== seq) return;                      // a newer query is already running
+  const hits = data.results ?? [];
+  $("meta").textContent = `${hits.length} results · ${Math.round(performance.now() - t0)} ms`;
+  $("results").innerHTML = hits.length ? hits.map((h, i) => `
+    <article class="hit" id="r${i + 1}">
+      <span class="num">${i + 1}</span>
+      ${h.image ? `<img src="${esc(h.image)}" alt="" loading="lazy" onerror="this.remove()">` : ""}
+      <div>
+        <h3><a href="${esc(h.url)}" target="_blank" rel="noopener">${esc(h.title || h.path)}</a></h3>
+        <div class="path">${esc(h.path)}</div>
+        <p>${esc(h.description || h.snippet)}</p>
+      </div>
+      <span class="score">${h.score}</span>
+    </article>`).join("") : `<p class="path">ไม่พบผลลัพธ์ / No results</p>`;
+  if (!hits.length) { $("answer").hidden = true; return; }
+  // results show immediately; the summary follows
+  summarize(q, my);
+}
+
+async function summarize(q, my) {
+  const r = await fetch(`/api/summary?q=${encodeURIComponent(q)}&mode=${$("mode").value}&lang=${$("lang").value}`);
+  const s = r.ok ? await r.json() : null;
+  if (my !== seq) return;
+  if (!s || !s.sentences || !s.sentences.length) { $("answer").hidden = true; return; }
+  $("answerText").innerHTML = s.sentences
+    .map(x => `${esc(x.text)}<a class="cite" href="#r${x.source}" title="Source ${x.source}">${x.source}</a>`)
+    .join(" ");
+  $("answer").hidden = false;
+  $("answer").classList.remove("stale");
+}
+
+// search only when the user submits: Enter key or the Search button (not while typing)
+$("q").addEventListener("keydown", e => { if (e.key === "Enter" && !e.isComposing) search(); });
+$("go").addEventListener("click", search);
+// changing mode / language re-runs the search only if there is already a query
+const rerun = () => { if ($("q").value.trim()) search(); };
+$("mode").addEventListener("change", rerun);
+$("lang").addEventListener("change", rerun);
+
+async function admin(url, body) {
+  $("log").textContent = "Running…";
+  const headers = { "Content-Type": "application/json" };
+  if ($("key").value) headers["X-Api-Key"] = $("key").value;
+  const r = await fetch(url, body === null
+    ? { headers }
+    : { method: "POST", headers, body: JSON.stringify(body) });
+  if (r.status === 202) return poll();
+  $("log").textContent = r.status + " " + (await r.text());
+}
+
+async function poll() {
+  $("bar").hidden = false;
+  for (;;) {
+    const p = await (await fetch("/api/progress")).json();
+    const cnt = p.total ? ` ${p.done}/${p.total} (${p.percent}%)` : "";
+    $("bar").value = p.state === "done" ? 100 : p.percent;
+    $("log").textContent = `${p.job}: ${p.state} — ${p.phase}${cnt} · ${p.elapsedSeconds}s`
+      + (p.error ? `\nError: ${p.error}` : "")
+      + (p.result ? `\n${JSON.stringify(p.result)}` : "");
+    if (p.state !== "running") return;
+    await new Promise(r => setTimeout(r, 1000));
+  }
+}
+$("update").onclick  = () => admin("/api/update", {});
+$("deep").onclick    = () => admin("/api/update", { deep: true });
+$("reindex").onclick = () => { if (confirm("Rebuild the whole index?")) admin("/api/reindex", {}); };
+$("status").onclick  = () => admin("/api/status", null);
+poll_if_running();
+async function poll_if_running() {
+  const p = await (await fetch("/api/progress")).json();
+  if (p.state === "running") poll();
+}
+</script>
+</body>
+</html>

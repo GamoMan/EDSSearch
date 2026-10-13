@@ -7,16 +7,27 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.31.0" />
-    <PackageReference Include="Microsoft.ML.OnnxRuntimeGenAI" Version="0.17.1" />
+    <PackageReference Include="Azure.Search.Documents" Version="12.0.0" />
+    <PackageReference Include="Cronos" Version="0.13.0" />
+    <PackageReference Include="Microsoft.ML.OnnxRuntime" Version="1.23.2" />
+    <PackageReference Include="Microsoft.ML.OnnxRuntime.Extensions" Version="0.14.0" />
+    <PackageReference Include="Microsoft.ML.OnnxRuntimeGenAI" Version="0.6.0" />
     <PackageReference Include="Microsoft.ML.Tokenizers" Version="2.0.0" />
     <PackageReference Include="NRedisStack" Version="1.8.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Folder Include="Properties\PublishProfiles\" />
+    <None Update="models\**\*" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
   <!-- run once:
-       dotnet add package NRedisStack
+       dotnet add package NRedisStack                              (Eds:Store = redis)
+       dotnet add package Azure.Search.Documents                   (Eds:Store = azure)
+       dotnet add package Cronos                                (cron schedule for Eds:Jobs)
        dotnet add package Microsoft.ML.OnnxRuntime
        dotnet add package Microsoft.ML.Tokenizers
+       dotnet add package Microsoft.ML.OnnxRuntime.Extensions   (only for models with the tokenizer inside, e.g. BertTokenizer op)
        dotnet add package Microsoft.ML.OnnxRuntimeGenAI      (local LLM for the answer; optional) -->
 
 </Project>

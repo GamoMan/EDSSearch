@@ -64,6 +64,7 @@
       <option value="th">ไทย</option>
     </select>
     <select id="mode" aria-label="Mode">
+      <option value="hybrid" selected>Hybrid</option>
       <option value="vector">Vector</option>
       <option value="text">Full-text</option>
     </select>
@@ -82,8 +83,21 @@
       <input id="key" type="password" placeholder="API key (if set)" aria-label="API key">
       <button id="update" class="primary">Update index</button>
       <button id="deep">Update (deep check)</button>
-      <button id="reindex">Full reindex</button>
+      <button id="reindex">Sync all pages</button>
+      <button id="rebuild">Rebuild (drop &amp; recreate)</button>
       <button id="status">Status</button>
+      <button id="jobs">Jobs</button>
+    </div>
+    <div class="admin">
+      <input id="urlbox" type="text" placeholder="URL or path to update, e.g. https://www.example.com/th/about" aria-label="URL to update" style="flex:1;min-width:240px">
+      <button id="updurl">Update this URL</button>
+    </div>
+    <div class="admin">
+      <button id="pxstatus">Proxy status</button>
+      <button id="pxon">Proxy on</button>
+      <button id="pxoff">Proxy off</button>
+      <input id="pxurl" type="text" placeholder="Test a URL against the proxy rules" aria-label="URL to test" style="flex:1;min-width:200px">
+      <button id="pxtest">Test</button>
     </div>
     <progress id="bar" max="100" value="0" hidden></progress>
     <div id="log"></div>
@@ -120,7 +134,7 @@ async function search() {
     </article>`).join("") : `<p class="path">ไม่พบผลลัพธ์ / No results</p>`;
   if (!hits.length) { $("answer").hidden = true; return; }
   // results show immediately; the summary follows
-  //summarize(q, my);
+  summarize(q, my);
 }
 
 let es = null;
@@ -188,7 +202,14 @@ async function poll() {
 }
 $("update").onclick  = () => admin("/api/update", {});
 $("deep").onclick    = () => admin("/api/update", { deep: true });
-$("reindex").onclick = () => { if (confirm("Rebuild the whole index?")) admin("/api/reindex", {}); };
+$("reindex").onclick = () => admin("/api/reindex", {});          // compares every page, changes only the differences
+$("rebuild").onclick = () => { if (confirm("Drop the index and rebuild it from scratch? Search returns nothing until pages are embedded again.")) admin("/api/reindex?rebuild=true", {}); };
+$("updurl").onclick  = () => { const u = $("urlbox").value.trim(); if (u) admin("/api/update/url?url=" + encodeURIComponent(u), {}); };
+$("jobs").onclick    = () => admin("/api/jobs", null);
+$("pxstatus").onclick = () => admin("/api/proxy", null);
+$("pxon").onclick     = () => admin("/api/proxy?enabled=true", {});
+$("pxoff").onclick    = () => admin("/api/proxy?enabled=false", {});
+$("pxtest").onclick   = () => { const u = $("pxurl").value.trim(); if (u) admin("/api/proxy/test?url=" + encodeURIComponent(u), null); };
 $("status").onclick  = () => admin("/api/status", null);
 poll_if_running();
 async function poll_if_running() {

@@ -1,32 +1,31 @@
+using System.Collections.Concurrent;
 using System.Net;
-using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
-using NRedisStack;
-using NRedisStack.RedisStackCommands;
-using NRedisStack.Search;
-using NRedisStack.Search.Literals.Enums;
-using StackExchange.Redis;
 
 var builder = WebApplication.CreateBuilder(args);
+AppPaths.Root = builder.Environment.ContentRootPath;      // models/... in appsettings.json are relative to the app folder
 var cfg = builder.Configuration.GetSection("Eds").Get<EdsOptions>() ?? new EdsOptions();
 
 builder.Services.AddSingleton(cfg);
-builder.Services.AddSingleton<IConnectionMultiplexer>(_ => ConnectionMultiplexer.Connect(cfg.Redis));
-builder.Services.AddSingleton(_ =>
+// every outgoing fetch (query-index.json, pages) goes through RoutingProxy, which decides per host
+// whether the corporate proxy is used (Eds:Proxy section, switchable at runtime with /api/proxy)
+builder.Services.AddSingleton<RoutingProxy>();
+builder.Services.AddSingleton(sp =>
 {
-    var h = new HttpClientHandler();
-    if (!string.IsNullOrWhiteSpace(cfg.Proxy))
+    var c = new HttpClient(new HttpClientHandler
     {
-        h.Proxy = new WebProxy(cfg.Proxy);
-        h.UseProxy = true;
-        h.DefaultProxyCredentials = CredentialCache.DefaultCredentials;
-    }
-    return new HttpClient(h) { Timeout = TimeSpan.FromSeconds(30) };
+        Proxy = sp.GetRequiredService<RoutingProxy>(),
+        UseProxy = true
+    }) { Timeout = TimeSpan.FromSeconds(30) };
+    c.DefaultRequestHeaders.UserAgent.TryParseAdd(cfg.Fetch.UserAgent);
+    return c;
 });
 builder.Services.AddSingleton<SearchService>();
+builder.Services.AddSingleton<JobScheduler>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<JobScheduler>());   // runs the scheduled jobs
 
 var app = builder.Build();
 app.Services.GetRequiredService<SearchService>().Init();
@@ -57,19 +56,34 @@ static async Task<IResult> Guard(Func<Task<object>> f, int ok = 200)
 {
     try { return Results.Json(await f(), statusCode: ok); }
     catch (InvalidOperationException e) { return Results.Json(new { error = e.Message }, statusCode: 409); }
+    catch (KeyNotFoundException e) { return Results.Json(new { error = e.Message }, statusCode: 404); }
 }
 
 // default: start in background and return 202 (poll /api/progress); add ?wait=true to block until finished
-app.MapPost("/api/reindex", (SearchService s, bool? wait) =>
-    Guard(() => s.ReindexAsync(wait ?? false), (wait ?? false) ? 200 : 202));
+// reindex = compare every page with what is indexed and change only the differences (search keeps working);
+// ?rebuild=true builds a brand-new index next to the current one and switches to it when it is complete
+// (needed after changing the embedding model; search keeps using the old index meanwhile)
+app.MapPost("/api/reindex", (SearchService s, bool? wait, bool? rebuild) =>
+    Guard(() => s.ReindexAsync(wait ?? false, rebuild ?? false), (wait ?? false) ? 200 : 202));
+// update: new / changed (date) / removed pages; body {"deep":true} compares content, {"urls":[...]} or {"paths":[...]} only those pages
 app.MapPost("/api/update", (SearchService s, UpdateRequest? req, bool? wait) =>
-    Guard(() => s.UpdateAsync(req?.Paths, req?.Deep ?? false, wait ?? false), (wait ?? false) ? 200 : 202));
+    Guard(() => s.UpdateAsync((req?.Paths ?? Array.Empty<string>()).Concat(req?.Urls ?? Array.Empty<string>()).ToArray(),
+                              req?.Deep ?? false, wait ?? false), (wait ?? false) ? 200 : 202));
+// one page: POST /api/update/url?url=https://www.example.com/th/about   (or just /th/about)
+app.MapPost("/api/update/url", (SearchService s, string url, bool? wait) =>
+    Guard(() => s.UpdateAsync(new[] { url }, false, wait ?? false), (wait ?? false) ? 200 : 202));
+// proxy: GET state, POST ?enabled=true|false switches it at runtime (no value = back to config), GET /test?url= shows the route
+app.MapGet("/api/proxy", (RoutingProxy p) => Results.Ok(p.State()));
+app.MapPost("/api/proxy", (RoutingProxy p, bool? enabled) => { p.SetOverride(enabled); return Results.Ok(p.State()); });
+app.MapGet("/api/proxy/test", (RoutingProxy p, string url) => Results.Ok(p.Test(url)));
+app.MapGet("/api/jobs", (JobScheduler j) => Results.Ok(j.List()));
+app.MapPost("/api/jobs/{name}/run", (JobScheduler j, string name) => Guard(() => j.RunNowAsync(name), 202));
 app.MapGet("/api/progress", (SearchService s) => Results.Ok(s.Progress()));
 app.MapGet("/api/search", (SearchService s, string q, int? k, string? mode, string? lang, bool? summary) =>
-    Results.Ok(s.Search(q, Math.Clamp(k ?? 10, 1, 50), mode ?? "vector", lang, summary ?? false)));   // summary=true -> extractive summary inside the JSON
+    Results.Ok(s.Search(q, Math.Clamp(k ?? 10, 1, 50), mode ?? "hybrid", lang, summary ?? false)));   // summary=true -> extractive summary inside the JSON
 // whole answer as JSON (LLM if enabled and loaded, otherwise extractive) - waits until generation has finished
 app.MapGet("/api/summary", (SearchService s, string q, string? mode, string? lang) =>
-    Results.Json(s.SummaryFor(q, mode ?? "vector", lang)));
+    Results.Json(s.SummaryFor(q, mode ?? "hybrid", lang)));
 
 // the same answer streamed token by token (Server-Sent Events) - used by the web page
 app.MapGet("/api/summary/stream", async (HttpContext ctx, SearchService s, string q, string? mode, string? lang) =>
@@ -84,7 +98,7 @@ app.MapGet("/api/summary/stream", async (HttpContext ctx, SearchService s, strin
     try
     {
         await Send(new { type = "meta", mode = s.LlmEnabled ? "llm" : "extractive" });
-        foreach (var piece in s.StreamAnswer(q, mode ?? "vector", lang, ctx.RequestAborted))
+        foreach (var piece in s.StreamAnswer(q, mode ?? "hybrid", lang, ctx.RequestAborted))
             await Send(new { type = "token", text = piece });
         await Send(new { type = "done" });
     }
@@ -92,12 +106,39 @@ app.MapGet("/api/summary/stream", async (HttpContext ctx, SearchService s, strin
     catch (Exception e) { await Send(new { type = "error", message = e.Message }); }
 });
 app.MapGet("/api/status", (SearchService s) => Results.Ok(s.Status()));
-app.MapGet("/api/embed-test", (SearchService s, string text) => Results.Ok(s.EmbedTest(text)));
+app.MapGet("/api/embed-test", (SearchService s, string text, string? text2) => Results.Ok(s.EmbedTest(text, text2)));
 
 app.Run();
 
 // ------------------------------------------------------------------ models
 public class Weights { public double Title { get; set; } = 1; public double Keywords { get; set; } = .6; public double Description { get; set; } = .4; public double Content { get; set; } = .2; }
+
+// Azure AI Search connection (Eds:Azure), used when Eds:Store is "azure"
+public class AzureSearchOptions
+{
+    public string Endpoint { get; set; } = "";             // https://<your-service>.search.windows.net
+    public string ApiKey { get; set; } = "";               // admin key (creates indexes, uploads and deletes documents)
+    public string IndexName { get; set; } = "eds-pages";   // ALIAS name. The real indexes are <alias>-<model fingerprint>-<time>
+    public string Analyzer { get; set; } = "th.microsoft"; // text analyzer: segments Thai words, also fine for English
+}
+
+// how politely pages and query-index.json are requested (the server answers 429 Too Many Requests when we are too fast)
+public class FetchOptions
+{
+    public int Concurrency { get; set; } = 4;         // pages fetched at the same time
+    public int MinIntervalMs { get; set; } = 200;     // minimum gap between two requests, all threads together (200 = 5 per second)
+    public int MaxRetries { get; set; } = 6;          // retries for 429 / 502 / 503 / 504 / timeouts
+    public int RetryBaseSeconds { get; set; } = 2;    // wait 2, 4, 8, 16 ... seconds, or the server's Retry-After when it sends one
+    public int MaxWaitSeconds { get; set; } = 120;    // never wait longer than this for one retry
+    public string UserAgent { get; set; } = "EdsSearch-Indexer/1.0";
+}
+public class DemoteRule
+{
+    public string PathPattern { get; set; } = "";      // regex on the page path, e.g. "/(news|press)(/|$)"
+    public double Factor { get; set; } = 0.9;          // score is multiplied by this (1 = no change, lower = pushed further down)
+}
+public class RankingOptions { public List<DemoteRule> Demote { get; set; } = new(); }
+
 public class SummaryOptions
 {
     public int TopDocs { get; set; } = 5;          // summarise from the best N results
@@ -106,36 +147,45 @@ public class SummaryOptions
 }
 public class EdsOptions
 {
-    public string BaseUrl { get; set; } = "";
+    public string BaseUrl { get; set; } = "";            // where pages are FETCHED from (e.g. https://main--site--org.aem.live)
+    public string PublicBaseUrl { get; set; } = "";      // domain of the LINKS in search results (e.g. https://www.example.com); empty = BaseUrl
+    public string TimeZone { get; set; } = "Asia/Bangkok";   // time zone of the job cron expressions
+    public List<JobConfig> Jobs { get; set; } = new();
     public string[] IndexPaths { get; set; } = Array.Empty<string>();   // e.g. /en/query-index.json, /th/query-index.json
-    public string Redis { get; set; } = "localhost:6379";
-    public int Dim { get; set; } = 2048;
-    public int Concurrency { get; set; } = 8;
-    public string Proxy { get; set; } = "";
-    public string ApiKey { get; set; } = "";
+    public string Store { get; set; } = "redis";         // where the index lives: "redis" or "azure"
+    public string Redis { get; set; } = "localhost:6379";   // used when Store = redis
+    public AzureSearchOptions Azure { get; set; } = new();  // used when Store = azure
+    public string ApiKey { get; set; } = "";             // protects the POST endpoints of THIS app (header X-Api-Key)
     public Weights Weights { get; set; } = new();
     public EmbeddingOptions Embedding { get; set; } = new();
     public SummaryOptions Summary { get; set; } = new();
     public LlmOptions Llm { get; set; } = new();
+    public RankingOptions Ranking { get; set; } = new();
+    public FetchOptions Fetch { get; set; } = new();
 }
-public record UpdateRequest(string[]? Paths, bool Deep = false);
+public record UpdateRequest(string[]? Paths, bool Deep = false, string[]? Urls = null);
 public record Entry(string Path, string Title, string Date, string Description, string Image, string Keywords, string Robots, string Content);
 public record Doc(string Path, string Title, string Date, string Description, string Image, string Keywords, string Content, string Hash);
 
 // ------------------------------------------------------------------ service
 public class SearchService
 {
-    const string Idx = "eds:idx", Pre = "eds:doc:", PathsKey = "eds:paths", DfKey = "eds:df", NKey = "eds:n", FpKey = "eds:fp";
-
     readonly EdsOptions o;
-    readonly IDatabase db;
     readonly HttpClient http;
     readonly ILogger<SearchService> log;
+    readonly IConfiguration conf;        // read again on every use -> PublicBaseUrl changes without a restart
     readonly SemaphoreSlim gate = new(1, 1);
-    readonly OnnxEmbedder? emb;          // null = hashed TF-IDF mode
+    readonly OnnxEmbedder? emb;          // null = no vectors: the index is text-only
     readonly LlmSummarizer? llm;         // null = extractive summary only
-    int[] df;
-    int n;
+    readonly List<(Regex re, double factor)> demote;   // pages whose score is lowered (e.g. news)
+    readonly ISearchStore store;         // Redis or Azure AI Search (Eds:Store)
+    const int BatchSize = 50;            // pages per write to the store
+    int n;                               // number of documents (kept up to date by the jobs)
+
+    // polite fetching: one shared pace for all threads, a global pause after 429, pages that could not be fetched
+    readonly object paceLock = new();
+    long nextSlot, pauseUntil;                                    // Environment.TickCount64 milliseconds
+    readonly ConcurrentDictionary<string, byte> failed = new();
 
     // job progress (read by /api/progress while a job runs in the background)
     string job = "", state = "idle", phase = "";
@@ -144,21 +194,49 @@ public class SearchService
     string? error;
     object? result;
 
-    public SearchService(EdsOptions o, IConnectionMultiplexer mux, HttpClient http, ILogger<SearchService> log)
+    public SearchService(EdsOptions o, HttpClient http, ILogger<SearchService> log, IConfiguration conf, RoutingProxy proxy)
     {
-        this.o = o; this.http = http; this.log = log; db = mux.GetDatabase(); df = new int[o.Dim];
+        this.o = o; this.http = http; this.log = log; this.conf = conf;
         emb = o.Embedding.Provider.Equals("onnx", StringComparison.OrdinalIgnoreCase)
             ? new OnnxEmbedder(o.Embedding, log) : null;
+        demote = o.Ranking.Demote.Where(r => r.PathPattern.Length > 0)
+            .Select(r => (new Regex(r.PathPattern, RegexOptions.IgnoreCase | RegexOptions.Compiled), r.Factor)).ToList();
         if (o.Llm.Enabled)
         {
             try { llm = new LlmSummarizer(o.Llm, log); }
             catch (Exception e)   // missing model must not stop search: fall back to the extractive summary
             { log.LogWarning("LLM summary disabled: {Msg}", e.Message); }
         }
+
+        var ctx = new StoreContext(o, emb?.Dim, Fingerprint, log, proxy);
+        store = o.Store.Trim().ToLowerInvariant() switch
+        {
+            "redis" => new RedisStore(ctx),
+            "azure" => new AzureStore(ctx),
+            _ => throw new InvalidOperationException($"Eds:Store must be \"redis\" or \"azure\" (it is \"{o.Store}\")")
+        };
     }
 
-    int VecDim => emb?.Dim ?? o.Dim;
-    string Fingerprint => emb is null ? $"hash:{o.Dim}" : $"onnx:{emb.Dim}:{System.IO.Path.GetFileName(o.Embedding.ModelPath)}";
+    // domain used for the links in search results; falls back to the fetch origin
+    string PublicBase
+    {
+        get
+        {
+            var p = conf["Eds:PublicBaseUrl"];
+            if (string.IsNullOrWhiteSpace(p)) p = conf["Eds:BaseUrl"];
+            return (p ?? o.BaseUrl).TrimEnd('/');
+        }
+    }
+
+    // identifies what the vectors in the index were made with (model file + size); a different value means "rebuild"
+    string Fingerprint
+    {
+        get
+        {
+            var s = (emb is null ? "text" : $"onnx:{emb.Dim}:{System.IO.Path.GetFileName(o.Embedding.ModelPath)}") + ":s3";
+            return Convert.ToHexString(SHA1.HashData(Encoding.UTF8.GetBytes(s)))[..8].ToLowerInvariant();
+        }
+    }
 
     void SetPhase(string p, int t = 0)
     {
@@ -182,6 +260,7 @@ public class SearchService
     {
         if (!await gate.WaitAsync(0)) throw new InvalidOperationException("An index job is already running");
         job = name; state = "running"; error = null; result = null; started = DateTime.UtcNow; finished = null;
+        failed.Clear();
         SetPhase("starting");
         var t = Task.Run(async () =>
         {
@@ -193,73 +272,34 @@ public class SearchService
         return wait ? await t : Progress();
     }
 
-    // ---------- startup
+    // ---------- startup: open (or create) the index in the chosen store
     public void Init()
     {
-        bool exists = true;
-        try { db.FT().Info(Idx); } catch (RedisServerException) { exists = false; }
-        if (exists && (string?)db.StringGet(FpKey) != Fingerprint)
-        {
-            // vector settings changed (provider / model / dimension): old vectors are unusable
-            log.LogWarning("Vector settings changed ({Fp}); dropping the old index. Run POST /api/reindex.", Fingerprint);
-            try { db.FT().DropIndex(Idx, dd: true); } catch (RedisServerException) { }
-            db.KeyDelete(new RedisKey[] { PathsKey, DfKey, NKey });
-            exists = false;
-        }
-        if (!exists) CreateIndex();
-        LoadStats();
+        n = store.Init();
+        log.LogInformation("Search store: {Store}; {N} documents; vectors {Vec}", store.Name, n,
+            emb is null ? "off (text only)" : $"on ({emb.Dim} dim)");
     }
 
-    void CreateIndex()
+    public object Status() => new
     {
-        var schema = new Schema()
-            .AddTextField("path", 1.0, noStem: true)
-            .AddTagField("lang")
-            .AddTextField("title", o.Weights.Title)
-            .AddTextField("keywords", o.Weights.Keywords)
-            .AddTextField("description", o.Weights.Description)
-            .AddTextField("content", o.Weights.Content)
-            .AddVectorField("v", Schema.VectorField.VectorAlgo.FLAT, new Dictionary<string, object>
-            {
-                ["TYPE"] = "FLOAT32",
-                ["DIM"] = VecDim,
-                ["DISTANCE_METRIC"] = "IP"
-            });
-        db.FT().Create(Idx, new FTCreateParams().On(IndexDataType.HASH).Prefix(Pre), schema);
-        db.StringSet(FpKey, Fingerprint);
-    }
-
-    void LoadStats()
-    {
-        var blob = db.StringGet(DfKey);
-        df = new int[o.Dim];
-        if (blob.HasValue)
-        {
-            var bytes = (byte[])blob!;
-            MemoryMarshal.Cast<byte, int>(bytes).Slice(0, Math.Min(o.Dim, bytes.Length / 4)).CopyTo(df);
-        }
-        n = (int)db.StringGet(NKey);
-    }
-
-    void SaveStats()
-    {
-        db.StringSet(DfKey, MemoryMarshal.AsBytes(df.AsSpan()).ToArray());
-        db.StringSet(NKey, n);
-    }
-
-    public object Status() => new { docs = n, provider = emb is null ? "hash" : "onnx", dim = VecDim, weights = o.Weights };
+        store = store.Name, documents = n, needsRebuild = store.NeedsRebuild,
+        vectors = emb is null ? "off (text only)" : $"on ({emb.Dim} dim)",
+        weights = o.Weights, details = store.Status()
+    };
 
     // sanity check for the embedding model: token ids (compare with the HF tokenizer), dim and norm
-    public object EmbedTest(string text)
+    public object EmbedTest(string text, string? text2 = null)
     {
-        if (emb is null) return new { provider = "hash", note = "Eds:Embedding:Provider is not onnx" };
+        if (emb is null) return new { provider = "none", note = "Eds:Embedding:Provider is not onnx" };
         var ids = emb.DebugIds(text);
         var v = emb.QueryVector(text);
+        // text2 (optional): cosine between the two texts - a quick quality check, e.g. a Thai phrase vs its English meaning
+        double? sim = text2 is null ? null : Math.Round(Dot(v, emb.QueryVector(text2)), 4);
         return new { provider = "onnx", tokens = ids.Length, ids = ids.Take(64), dim = v.Length,
-                     norm = Math.Round(Math.Sqrt(v.Sum(x => (double)x * x)), 4), head = v.Take(5) };
+                     norm = Math.Round(Math.Sqrt(v.Sum(x => (double)x * x)), 4), head = v.Take(5), similarity = sim };
     }
 
-    // ---------- tokenizing (no LLM): Latin words as-is, Thai as char 2/3-grams
+    // ---------- tokenizing: Latin words as-is, Thai as char 2/3-grams (only used to rank sentences for the summary without vectors)
     static IEnumerable<string> Tokens(string text)
     {
         var run = new StringBuilder();
@@ -289,49 +329,74 @@ public class SearchService
         }
     }
 
-    int Bucket(string t)
+    // ---------- polite HTTP: pacing, retry on 429 / 5xx, Retry-After
+    async Task Pace()
     {
-        uint h = 2166136261;
-        foreach (var c in t) { h ^= c; h *= 16777619; }
-        return (int)(h % (uint)o.Dim);
+        long wait;
+        lock (paceLock)
+        {
+            long now = Environment.TickCount64;
+            long slot = Math.Max(Math.Max(now, nextSlot), pauseUntil);
+            nextSlot = slot + Math.Max(0, o.Fetch.MinIntervalMs);
+            wait = slot - now;
+        }
+        if (wait > 0) await Task.Delay((int)Math.Min(wait, int.MaxValue));
     }
 
-    Dictionary<int, int> Counts(string? text)
+    // after a 429 every thread waits, not only the one that was refused
+    void PauseAll(TimeSpan d)
     {
-        var d = new Dictionary<int, int>();
-        if (string.IsNullOrWhiteSpace(text)) return d;
-        foreach (var t in Tokens(text)) { var b = Bucket(t); d[b] = d.GetValueOrDefault(b) + 1; }
-        return d;
+        lock (paceLock) pauseUntil = Math.Max(pauseUntil, Environment.TickCount64 + (long)d.TotalMilliseconds);
     }
 
-    double Idf(int b) => Math.Log((n + 1.0) / (df[b] + 1.0)) + 1.0;
-
-    // add weight * L2-normalised TF-IDF of one field into v
-    void AddField(float[] v, Dictionary<int, int> counts, double weight)
+    TimeSpan RetryDelay(HttpResponseMessage? resp, int attempt)
     {
-        if (counts.Count == 0) return;
-        var tmp = new Dictionary<int, double>();
-        double norm = 0;
-        foreach (var (b, c) in counts) { var w = (1 + Math.Log(c)) * Idf(b); tmp[b] = w; norm += w * w; }
-        norm = Math.Sqrt(norm);
-        foreach (var (b, w) in tmp) v[b] += (float)(weight * w / norm);
+        var f = o.Fetch;
+        TimeSpan? server = null;
+        if (resp?.Headers.RetryAfter is { } ra)
+            server = ra.Delta ?? (ra.Date is { } dt ? (TimeSpan?)(dt - DateTimeOffset.UtcNow) : null);
+        var backoff = TimeSpan.FromSeconds(Math.Min(f.MaxWaitSeconds, f.RetryBaseSeconds * Math.Pow(2, attempt)));
+        var d = server is { } s && s > TimeSpan.Zero ? s : backoff;
+        d += TimeSpan.FromMilliseconds(Random.Shared.Next(0, 1000));          // jitter
+        var max = TimeSpan.FromSeconds(f.MaxWaitSeconds);
+        return d > max ? max : d;
     }
 
-    // doc vec = sum_f weight_f * unit(tfidf_f);  query vec = unit(tfidf)
-    // => inner product = sum_f weight_f * cosine(query, field_f)
-    float[] DocVector(Dictionary<int, int>[] c)
+    async Task<HttpResponseMessage> GetAsync(string url)
     {
-        var v = new float[o.Dim];
-        AddField(v, c[0], o.Weights.Title);
-        AddField(v, c[1], o.Weights.Keywords);
-        AddField(v, c[2], o.Weights.Description);
-        AddField(v, c[3], o.Weights.Content);
-        return v;
+        var f = o.Fetch;
+        for (int attempt = 0; ; attempt++)
+        {
+            await Pace();
+            string why;
+            TimeSpan wait;
+            try
+            {
+                var resp = await http.GetAsync(url);
+                int code = (int)resp.StatusCode;
+                if (code is not (429 or 502 or 503 or 504) || attempt >= f.MaxRetries) return resp;
+                why = $"HTTP {code}";
+                wait = RetryDelay(resp, attempt);
+                resp.Dispose();
+            }
+            catch (Exception e) when ((e is HttpRequestException || e is TaskCanceledException) && attempt < f.MaxRetries)
+            {
+                why = e.GetType().Name + ": " + e.Message;
+                wait = RetryDelay(null, attempt);
+            }
+            log.LogWarning("{Url}: {Why} - waiting {Sec:F0}s before retry {N}/{Max}", url, why, wait.TotalSeconds, attempt + 1, f.MaxRetries);
+            PauseAll(wait);
+        }
     }
 
-    static byte[] Bytes<T>(T[] a) where T : struct => MemoryMarshal.AsBytes(a.AsSpan()).ToArray();
+    async Task<string> GetStringAsync(string url)
+    {
+        using var resp = await GetAsync(url);
+        resp.EnsureSuccessStatusCode();
+        return await resp.Content.ReadAsStringAsync();
+    }
 
-    // ---------- fetching
+    // ---------- reading query-index.json and the pages
     async Task<List<Entry>> FetchIndexAsync()
     {
         var list = new List<Entry>();
@@ -340,7 +405,7 @@ public class SearchService
         for (int offset = 0; ; offset += limit)
         {
             var url = $"{o.BaseUrl.TrimEnd('/')}{indexPath}?limit={limit}&offset={offset}";
-            using var json = JsonDocument.Parse(await http.GetStringAsync(url));
+            using var json = JsonDocument.Parse(await GetStringAsync(url));
             var root = json.RootElement;
             var data = root.GetProperty("data");
             foreach (var e in data.EnumerateArray())
@@ -357,13 +422,6 @@ public class SearchService
         p.ValueKind == JsonValueKind.String ? p.GetString() ?? "" :
         p.ValueKind is JsonValueKind.Number ? p.GetRawText() : "";
 
-    // "/th/about" -> "th", "/en/" -> "en"; anything else -> "other"
-    static string Lang(string path)
-    {
-        var m = Regex.Match(path, @"^/([a-z]{2})(/|$)");
-        return m.Success ? m.Groups[1].Value : "other";
-    }
-
     string PlainUrl(string path)
     {
         var p = path.EndsWith('/') ? path + "index" : path;
@@ -375,25 +433,56 @@ public class SearchService
         html = Regex.Replace(html, @"<(script|style)[\s\S]*?</\1>", " ", RegexOptions.IgnoreCase);
         html = Regex.Replace(html, @"</(p|div|h[1-6]|li|tr|section|ul|ol|table|blockquote)>|<br\s*/?>", "\n", RegexOptions.IgnoreCase);
         html = Regex.Replace(html, @"<[^>]+>", " ");
-        html = Regex.Replace(WebUtility.HtmlDecode(html), @"[ \t\r\f\v]+", " ");
+        html = Regex.Replace(Decode(html), @"[ \t\r\f\v\u00A0\u2000-\u200A\u202F\u205F\u3000]+", " ");   // incl. &nbsp;
+        html = html.Replace("\u200B", "").Replace("\uFEFF", "");                                         // zero-width characters
         return Regex.Replace(html, @"\s*\n\s*", "\n").Trim();      // one newline between blocks
+    }
+
+    // &quot; &amp;quot; &#39; &nbsp; ... -> real characters. Repeated, because some sources are escaped twice.
+    static string Decode(string s)
+    {
+        for (int i = 0; i < 3 && s.Contains('&'); i++)
+        {
+            var d = WebUtility.HtmlDecode(s);
+            if (d == s) break;
+            s = d;
+        }
+        return s;
+    }
+
+    // one-line text for titles, descriptions, keywords, snippets: readable characters, no tags, single spaces
+    static string CleanLine(string? s)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        s = Decode(s);
+        s = Regex.Replace(s, @"</?[a-zA-Z][^>]*>", " ");                  // stray html tags
+        s = s.Replace("\u200B", "").Replace("\uFEFF", "");
+        return Regex.Replace(s, @"\s+", " ").Trim();                       // \s also matches the non-breaking space
     }
 
     async Task<Doc?> ToDocAsync(Entry e)
     {
         if (e.Robots.Contains("noindex", StringComparison.OrdinalIgnoreCase)) return null;
         if (Regex.IsMatch(e.Title, @"^\s*404(\D|$)")) return null;     // error pages ("404", "404 - Page not found"): not indexed, page not even fetched
-        string content = e.Content;
-        try { content = HtmlToText(await http.GetStringAsync(PlainUrl(e.Path))); }
-        catch (HttpRequestException) { /* fall back to the content column */ }
+        string content = HtmlToText(e.Content);
+        try { content = HtmlToText(await GetStringAsync(PlainUrl(e.Path))); }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.NotFound) { /* no .plain.html: use the content column */ }
+        catch (Exception ex) when (ex is HttpRequestException || ex is TaskCanceledException)
+        {
+            // still failing after the retries: keep what is indexed for this page instead of indexing it half-empty
+            failed[e.Path] = 1;
+            log.LogWarning("{Path}: could not be fetched ({Msg}); left unchanged", e.Path, ex.Message);
+            return null;
+        }
+        string title = CleanLine(e.Title), keywords = CleanLine(e.Keywords), description = CleanLine(e.Description);
         var hash = Convert.ToHexString(SHA1.HashData(Encoding.UTF8.GetBytes(
-            string.Join("\u0001", e.Title, e.Keywords, e.Description, content))));
-        return new Doc(e.Path, e.Title, e.Date, e.Description, e.Image, e.Keywords, content, hash);
+            string.Join("\u0001", title, keywords, description, content))));
+        return new Doc(e.Path, title, e.Date, description, e.Image, keywords, content, hash);
     }
 
     async Task<List<Doc>> BuildDocsAsync(IEnumerable<Entry> entries)
     {
-        using var sem = new SemaphoreSlim(o.Concurrency);
+        using var sem = new SemaphoreSlim(Math.Max(1, o.Fetch.Concurrency));
         var tasks = entries.Select(async e =>
         {
             await sem.WaitAsync();
@@ -408,59 +497,32 @@ public class SearchService
         return (await Task.WhenAll(tasks)).Where(d => d != null).Select(d => d!).ToList();
     }
 
-    // ---------- writing to Redis
-    Dictionary<int, int>[] FieldCounts(Doc d) =>
-        new[] { Counts(d.Title), Counts(d.Keywords), Counts(d.Description), Counts(d.Content) };
-
-    static ushort[] BucketsOf(Dictionary<int, int>[] counts) =>
-        counts.SelectMany(c => c.Keys).Distinct().Select(b => (ushort)b).ToArray();
-
-    void Write(Doc d, float[] vec, ushort[] buckets)
+    // ---------- writing to the store
+    StoreDoc ToStoreDoc(Doc d)
     {
-        var flat = Regex.Replace(d.Content, @"\s+", " ");
-        var snippet = flat.Length > 240 ? flat[..240] + "…" : flat;
-        db.HashSet(Pre + d.Path, new[]
+        float[]? v = null;
+        if (emb is not null)
         {
-            new HashEntry("path", d.Path), new HashEntry("lang", Lang(d.Path)), new HashEntry("title", d.Title),
-            new HashEntry("keywords", d.Keywords), new HashEntry("description", d.Description),
-            new HashEntry("content", d.Content), new HashEntry("snippet", snippet),
-            new HashEntry("image", d.Image), new HashEntry("date", d.Date), new HashEntry("hash", d.Hash),
-            new HashEntry("v", Bytes(vec)), new HashEntry("b", Bytes(buckets))
-        });
-        db.SetAdd(PathsKey, d.Path);
+            var x = emb.DocVector(d, o.Weights);
+            if (x.Any(f => f != 0)) v = x;      // an all-zero vector (page without any text) is not stored
+        }
+        return new StoreDoc(d, v);
     }
 
-    void Remove(string path)
+    // ---------- API: reindex
+    public Task<object> ReindexAsync(bool wait, bool rebuild = false) => RunJob("reindex", () => ReindexCore(rebuild), wait);
+
+    async Task<object> ReindexCore(bool rebuild)
     {
-        var b = db.HashGet(Pre + path, "b");
-        if (b.HasValue)
-            foreach (var x in MemoryMarshal.Cast<byte, ushort>((byte[])b!))
-                if (x < df.Length) df[x] = Math.Max(0, df[x] - 1);
-        if (db.KeyDelete(Pre + path)) n = Math.Max(0, n - 1);
-        db.SetRemove(PathsKey, path);
+        // an index already exists and fits the model: compare every page with it (content hash) and change only what differs.
+        // Nothing is deleted up front, so search keeps working while this runs.
+        if (!rebuild && !store.NeedsRebuild && n > 0) return await UpdateCore(null, deep: true);
+        return await BuildNewIndex();
     }
 
-    void Upsert(Doc d)
-    {
-        if (db.KeyExists(Pre + d.Path)) Remove(d.Path);
-        n++;
-        if (emb is not null) { Write(d, emb.DocVector(d, o.Weights), Array.Empty<ushort>()); return; }
-        var counts = FieldCounts(d);
-        foreach (var b in counts.SelectMany(c => c.Keys).Distinct()) df[b]++;
-        Write(d, DocVector(counts), BucketsOf(counts));
-    }
-
-    void RecreateIndex()
-    {
-        try { db.FT().DropIndex(Idx, dd: true); } catch (RedisServerException) { }
-        db.KeyDelete(new RedisKey[] { PathsKey, DfKey, NKey });
-        CreateIndex();
-    }
-
-    // ---------- API: reindex (full rebuild)
-    public Task<object> ReindexAsync(bool wait) => RunJob("reindex", ReindexCore, wait);
-
-    async Task<object> ReindexCore()
+    // full build. Azure: a NEW index next to the live one, the alias moves when it is complete (no empty period).
+    // Redis: the index is dropped and built again in place.
+    async Task<object> BuildNewIndex()
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
         SetPhase("fetching query-index");
@@ -468,45 +530,28 @@ public class SearchService
         SetPhase("fetching pages", entries.Count);
         var docs = await BuildDocsAsync(entries);
 
-        if (emb is null)
+        SetPhase("preparing the index");
+        var session = store.BeginRebuild();
+        try
         {
-            // hashed TF-IDF: IDF needs every document first -> compute all vectors, then recreate + write
-            SetPhase("computing vectors", docs.Count);
-            var prepared = new List<(Doc d, float[] vec, ushort[] b)>(docs.Count);
-            var counts = docs.Select(FieldCounts).ToList();
-            var newDf = new int[o.Dim];
-            foreach (var c in counts)
-                foreach (var k in c.SelectMany(x => x.Keys).Distinct()) newDf[k]++;
-            df = newDf; n = docs.Count;
-            for (int i = 0; i < docs.Count; i++)
-            { prepared.Add((docs[i], DocVector(counts[i]), BucketsOf(counts[i]))); Interlocked.Increment(ref done); }
-
-            SetPhase("recreating index");
-            RecreateIndex();
-
-            SetPhase("writing to Redis", prepared.Count);
-            foreach (var (d, vec, b) in prepared) { Write(d, vec, b); Interlocked.Increment(ref done); }
-        }
-        else
-        {
-            // embeddings are slow per page, so each page is written as soon as it is embedded:
-            // it shows up in Redis immediately, is searchable while the job runs, and progress = pages written
-            SetPhase("recreating index");
-            RecreateIndex();
-            df = new int[o.Dim]; n = 0;
-            SetPhase("embedding + writing", docs.Count);
+            SetPhase(emb is null ? "writing" : "embedding + writing", docs.Count);
+            var batch = new List<StoreDoc>();
             foreach (var d in docs)
             {
-                Write(d, emb.DocVector(d, o.Weights), Array.Empty<ushort>());
-                n++;
+                batch.Add(ToStoreDoc(d));
                 int cnt = Interlocked.Increment(ref done);
+                if (batch.Count >= BatchSize) { session.Add(batch); batch = new List<StoreDoc>(); }
                 if (cnt % 20 == 0 || cnt == docs.Count)
-                    log.LogInformation("reindex: embedded {Done}/{Total} pages ({Sec:F0}s)", cnt, docs.Count, sw.Elapsed.TotalSeconds);
+                    log.LogInformation("reindex: {Done}/{Total} pages ({Sec:F0}s)", cnt, docs.Count, sw.Elapsed.TotalSeconds);
             }
+            if (batch.Count > 0) session.Add(batch);
+            SetPhase("finishing");
+            await session.CommitAsync(docs.Count);
         }
-        SaveStats();
+        catch { session.Abort(); throw; }
 
-        return new { indexed = n, skipped = entries.Count - n, seconds = Math.Round(sw.Elapsed.TotalSeconds, 1) };
+        n = docs.Count;
+        return new { store = store.Name, indexed = n, skipped = entries.Count - n, failed = failed.Count, seconds = Math.Round(sw.Elapsed.TotalSeconds, 1) };
     }
 
     // ---------- API: update (incremental)
@@ -515,100 +560,170 @@ public class SearchService
 
     async Task<object> UpdateCore(string[]? paths, bool deep)
     {
-        if (n == 0) return await ReindexCore();      // nothing indexed yet
+        // nothing indexed yet, or the index was built with another model: it has to be built from scratch
+        if (n == 0 || store.NeedsRebuild) return await BuildNewIndex();
 
         SetPhase("fetching query-index");
         var entries = await FetchIndexAsync();
         var byPath = entries.ToDictionary(e => e.Path);
-        var existing = db.SetMembers(PathsKey).Select(x => (string)x!).ToHashSet();
+        SetPhase("reading the index");
+        var existing = store.Existing();
 
+        paths = NormalizePaths(paths);
         List<string> check, removed;
+        var src = byPath;                                  // where each page's metadata comes from
         if (paths is { Length: > 0 })
         {
-            check = paths.Where(byPath.ContainsKey).ToList();
-            removed = paths.Where(p => !byPath.ContainsKey(p) && existing.Contains(p)).ToList();
+            // pages named by the caller: use the query-index entry if there is one, otherwise read
+            // title / description / keywords from the page itself (query-index can lag behind a fresh publish)
+            src = new Dictionary<string, Entry>();
+            foreach (var p in paths)
+            {
+                if (byPath.TryGetValue(p, out var e)) src[p] = e;
+                else if (await FetchEntryFromPageAsync(p) is { } pe) src[p] = pe;
+            }
+            check = src.Keys.ToList();
+            removed = paths.Where(p => !src.ContainsKey(p) && existing.ContainsKey(p)).ToList();   // page is gone (404)
         }
         else
         {
-            removed = existing.Except(byPath.Keys).ToList();
+            removed = existing.Keys.Except(byPath.Keys).ToList();
             check = deep
                 ? byPath.Keys.ToList()
-                : byPath.Keys.Where(p => !existing.Contains(p) || (string?)db.HashGet(Pre + p, "date") != byPath[p].Date).ToList();
+                : byPath.Keys.Where(p => !existing.ContainsKey(p) || existing[p].date != byPath[p].Date).ToList();
         }
 
         SetPhase("fetching pages", check.Count);
-        var docs = await BuildDocsAsync(check.Select(p => byPath[p]));
-        SetPhase(emb is null ? "writing to Redis" : "embedding + writing", docs.Count);
+        var docs = await BuildDocsAsync(check.Select(p => src[p]));
+        SetPhase(emb is null ? "writing" : "embedding + writing", docs.Count);
         var okPaths = docs.Select(d => d.Path).ToHashSet();
-        removed.AddRange(check.Where(p => !okPaths.Contains(p) && existing.Contains(p))); // became noindex
+        removed.AddRange(check.Where(p => !okPaths.Contains(p) && existing.ContainsKey(p) && !failed.ContainsKey(p))); // became noindex (not: could not be fetched)
 
         int added = 0, updated = 0, unchanged = 0;
+        var batch = new List<StoreDoc>();
         foreach (var d in docs)
         {
             Interlocked.Increment(ref done);
-            bool had = existing.Contains(d.Path);
-            if (had && deep && (string?)db.HashGet(Pre + d.Path, "hash") == d.Hash) { unchanged++; continue; }
-            Upsert(d);
+            bool had = existing.ContainsKey(d.Path);
+            if (had && deep && existing[d.Path].hash == d.Hash) { unchanged++; continue; }
+            batch.Add(ToStoreDoc(d));
             if (had) updated++; else added++;
+            if (batch.Count >= BatchSize) { store.Upsert(batch); batch = new List<StoreDoc>(); }
         }
-        foreach (var p in removed.Distinct()) Remove(p);
-        SaveStats();
+        if (batch.Count > 0) store.Upsert(batch);
 
-        return new { added, updated, removed = removed.Distinct().Count(), unchanged, total = n };
+        var gone = removed.Distinct().Where(existing.ContainsKey).ToList();
+        store.Delete(gone);
+        n = Math.Max(0, existing.Count + added - gone.Count);
+
+        return new { added, updated, removed = gone.Count, unchanged, failed = failed.Count, total = n };
     }
+
+    // ---------- URLs / paths from the caller
+    static string ToPath(string s)
+    {
+        s = s.Trim();
+        if (s.Length == 0) return "";
+        if (Uri.TryCreate(s, UriKind.Absolute, out var u) && (u.Scheme == "http" || u.Scheme == "https"))
+            s = Uri.UnescapeDataString(u.AbsolutePath);                    // the domain is ignored
+        else
+        {
+            var cut = s.IndexOfAny(new[] { '?', '#' });
+            if (cut >= 0) s = s[..cut];
+        }
+        return s.StartsWith('/') ? s : "/" + s;
+    }
+
+    static string[]? NormalizePaths(IEnumerable<string>? items) =>
+        items?.Select(ToPath).Where(p => p.Length > 0).Distinct().ToArray();
+
+    static string MetaTag(string html, string key)
+    {
+        var k = Regex.Escape(key);
+        var m = Regex.Match(html, $@"<meta\s+[^>]*?(?:name|property)\s*=\s*[""']{k}[""'][^>]*?content\s*=\s*[""']([^""']*)[""']", RegexOptions.IgnoreCase);
+        if (!m.Success)
+            m = Regex.Match(html, $@"<meta\s+[^>]*?content\s*=\s*[""']([^""']*)[""'][^>]*?(?:name|property)\s*=\s*[""']{k}[""']", RegexOptions.IgnoreCase);
+        return m.Success ? m.Groups[1].Value : "";
+    }
+
+    // metadata read from the page's own HTML; null when the page does not exist (404 / 410)
+    async Task<Entry?> FetchEntryFromPageAsync(string path)
+    {
+        using var resp = await GetAsync(o.BaseUrl.TrimEnd('/') + path);
+        if (resp.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.Gone) return null;
+        resp.EnsureSuccessStatusCode();
+        var html = await resp.Content.ReadAsStringAsync();
+        var title = Regex.Match(html, @"<title[^>]*>([\s\S]*?)</title>", RegexOptions.IgnoreCase) is { Success: true } t ? t.Groups[1].Value : "";
+        var date = (resp.Content.Headers.LastModified ?? DateTimeOffset.UtcNow).ToString("yyyy-MM-dd");
+        return new Entry(path, title, date, MetaTag(html, "description"), MetaTag(html, "og:image"),
+                         MetaTag(html, "keywords"), MetaTag(html, "robots"), "");
+    }
+
+    // ---------- scheduled jobs (see JobScheduler)
+    public Task<object> RunScheduledAsync(JobConfig j, bool wait)
+    {
+        var name = "scheduled:" + j.Name;
+        return j.Action.Equals("reindex", StringComparison.OrdinalIgnoreCase)
+            ? RunJob(name, () => ReindexCore(j.Rebuild), wait)
+            : RunJob(name, () => UpdateCore(NormalizePaths((j.Paths ?? Array.Empty<string>()).Concat(j.Urls ?? Array.Empty<string>())), j.Deep), wait);
+    }
+
+    public (string state, string? error, object? result, double seconds) Outcome() =>
+        (state, error, result, started is null ? 0 : Math.Round(((finished ?? DateTime.UtcNow) - started.Value).TotalSeconds, 1));
 
     // ---------- API: search
     public record Hit(string? path, string url, string? title, string? description, string? snippet,
                       string? image, string? date, double score);
 
-    List<Hit> SearchHits(string q, int k, string mode, string? lang)
+    // vector / hybrid need embeddings and an index built with the same model; otherwise text-only
+    string ResolveMode(string? mode)
     {
-        // optional language filter, e.g. lang=th
-        var filter = lang is { Length: 2 } && Regex.IsMatch(lang, "^[a-z]{2}$") ? $"@lang:{{{lang}}}" : null;
-        if (string.IsNullOrWhiteSpace(q) || n == 0) return new List<Hit>();
-        var fields = new[] { "path", "title", "description", "image", "date", "snippet" };
-        double wsum = o.Weights.Title + o.Weights.Keywords + o.Weights.Description + o.Weights.Content;
-
-        Hit ToHit(Document d, double score) => new((string?)d["path"], o.BaseUrl.TrimEnd('/') + (string?)d["path"],
-            (string?)d["title"], (string?)d["description"], (string?)d["snippet"],
-            (string?)d["image"], (string?)d["date"], score);
-
-        if (mode == "text")   // RediSearch full-text, field weights from the schema (Latin words only)
-        {
-            var words = Tokens(q).Where(t => !(t[0] >= '\u0E00' && t[0] <= '\u0E7F')).Distinct().ToList();
-            if (words.Count == 0) return new List<Hit>();
-            var tq = new Query((filter is null ? "" : filter + " ") + "(" + string.Join("|", words) + ")")
-                .SetWithScores().ReturnFields(fields).Limit(0, k);
-            return db.FT().Search(Idx, tq).Documents.Select(d => ToHit(d, Math.Round(d.Score, 4))).ToList();
-        }
-
-        float[] qv;
-        if (emb is not null) qv = emb.QueryVector(q);
-        else
-        {
-            var qc = Counts(q);
-            if (qc.Count == 0) return new List<Hit>();
-            qv = new float[o.Dim];
-            AddField(qv, qc, 1.0);
-        }
-
-        var query = new Query($"{(filter is null ? "*" : "(" + filter + ")")}=>[KNN {k} @v $B AS dist]")
-            .AddParam("B", Bytes(qv))
-            .ReturnFields(fields.Append("dist").ToArray())
-            .SetSortBy("dist")
-            .Limit(0, k)
-            .Dialect(2);
-        var res = db.FT().Search(Idx, query);
-        // IP distance = 1 - inner product; divide by the weight sum -> 0..1 weighted cosine
-        return res.Documents
-            .Select(d => ToHit(d, Math.Round(Math.Max(0, 1 - (double)d["dist"]) / wsum, 4)))
-            .Where(h => h.score > 0).ToList();
+        mode = (mode ?? "hybrid").Trim().ToLowerInvariant();
+        if (mode is not ("vector" or "text" or "hybrid")) mode = "hybrid";
+        return mode != "text" && (emb is null || store.NeedsRebuild) ? "text" : mode;
     }
+
+    List<Hit> SearchHits(string q, int k, string mode, string? lang, out string usedMode)
+    {
+        usedMode = ResolveMode(mode);
+        if (string.IsNullOrWhiteSpace(q)) return new List<Hit>();
+        int fetch = demote.Count > 0 ? Math.Min(Math.Max(k * 4, 50), 200) : k;     // demoted pages may drop out of the top k
+
+        var request = new SearchRequest(
+            usedMode != "vector" ? q : null,                       // words (BM25 / full-text)
+            usedMode != "text" ? emb!.QueryVector(q) : null,       // meaning (vector)
+            fetch, lang);
+
+        var hits = store.Search(request)
+            .Select(r => new Hit(r.Path, PublicBase + r.Path, CleanLine(r.Title), CleanLine(r.Description),
+                                 null, r.Image, r.Date, Math.Round(r.Score, 4)))
+            .ToList();
+        return Finish(hits, k);
+    }
+
+    double DemoteFactor(string path) =>
+        demote.Where(r => r.re.IsMatch(path)).Select(r => r.factor).DefaultIfEmpty(1.0).Min();
+
+    // demote (e.g. news), top k, then a snippet from the content for pages without a description
+    List<Hit> Finish(List<Hit> hits, int k)
+    {
+        if (demote.Count > 0)   // lower the score, then re-sort - even a best match moves down
+            hits = hits.Select(h => h with { score = Math.Round(h.score * DemoteFactor(h.path!), 4) })
+                       .OrderByDescending(h => h.score).ToList();
+        return hits.Take(k).Select(h =>
+        {
+            if (!string.IsNullOrWhiteSpace(h.description)) return h;
+            var flat = CleanLine(GetField(h.path!, "content"));
+            return h with { snippet = flat.Length > 240 ? flat[..240] + "…" : flat };
+        }).ToList();
+    }
+
+    string? GetField(string path, string field) => store.GetField(path, field);
 
     public object Search(string q, int k, string mode, string? lang = null, bool summary = true)
     {
-        var hits = SearchHits(q, k, mode, lang);
-        return new { mode, summary = summary ? Summarize(q, hits) : null, results = hits };
+        var hits = SearchHits(q, k, mode, lang, out var used);
+        return new { mode = used, summary = summary ? Summarize(q, hits) : null, results = hits };
     }
 
     // same top results as /api/search, so the [n] citations match the result numbers
@@ -629,7 +744,7 @@ public class SearchService
         var seen = new HashSet<string>();
         foreach (var raw in SentSplit.Split(text))
         {
-            var seg = raw.Trim();
+            var seg = CleanLine(raw);
             if (seg.Length == 0) continue;
             foreach (var piece in CutLong(seg, 220))
                 if (piece.Length >= 25 && seen.Add(piece)) yield return piece;
@@ -659,19 +774,6 @@ public class SearchService
 
     static string Clip(string s, int n) => s.Length <= n ? s : s[..n] + "…";
 
-    double SparseCos(Dictionary<int, int> a, Dictionary<int, int> b)
-    {
-        double dot = 0, na = 0, nb = 0;
-        foreach (var (k, c) in a)
-        {
-            var w = (1 + Math.Log(c)) * Idf(k);
-            na += w * w;
-            if (b.TryGetValue(k, out var c2)) dot += w * (1 + Math.Log(c2)) * Idf(k);
-        }
-        foreach (var (k, c) in b) { var w = (1 + Math.Log(c)) * Idf(k); nb += w * w; }
-        return na > 0 && nb > 0 ? dot / Math.Sqrt(na * nb) : 0;
-    }
-
     public record ExtractiveSummary(string text, List<SummarySentence> sentences, List<int> sources);
 
     // best passages for the query from the top pages: sentences, plus page descriptions when `loose`
@@ -682,14 +784,13 @@ public class SearchService
         var cands = new List<Cand>();
         for (int i = 0; i < Math.Min(so.TopDocs, hits.Count); i++)
         {
-            var key = Pre + hits[i].path;
             if (loose)
             {
-                var desc = ((string?)db.HashGet(key, "description") ?? "").Trim();
+                var desc = CleanLine(hits[i].description);
                 if (desc.Length >= 25) cands.Add(new Cand(i, -1, desc));
             }
             int pos = 0;
-            foreach (var sent in Sentences((string?)db.HashGet(key, "content") ?? "").Take(so.PerDoc))
+            foreach (var sent in Sentences(GetField(hits[i].path!, "content") ?? "").Take(so.PerDoc))
                 cands.Add(new Cand(i, pos++, sent));
         }
         if (cands.Count == 0) return new List<Cand>();
@@ -702,10 +803,10 @@ public class SearchService
             vecs = emb.PassageVectors(cands.Select(c => c.Text).ToList());
             sims = vecs.Select(v => Dot(qv, v)).ToArray();
         }
-        else
+        else   // no vectors: share of the query words that appear in the sentence
         {
-            var qc = Counts(q);
-            sims = cands.Select(c => SparseCos(qc, Counts(c.Text))).ToArray();
+            var qt = Tokens(q).ToHashSet();
+            sims = cands.Select(c => qt.Count == 0 ? 0 : (double)Tokens(c.Text).Distinct().Count(qt.Contains) / qt.Count).ToArray();
         }
 
         double Score(int i) => sims[i] * (1 - 0.04 * cands[i].Doc);      // small bonus for higher-ranked pages
@@ -762,7 +863,7 @@ public class SearchService
     // pieces of the answer as they are produced; extractive fallback returns the whole text in one piece
     public IEnumerable<string> StreamAnswer(string q, string mode, string? lang, CancellationToken ct)
     {
-        var hits = SearchHits(q, o.Summary.TopDocs, mode, lang);
+        var hits = SearchHits(q, o.Summary.TopDocs, mode, lang, out _);
         if (hits.Count == 0) yield break;
 
         if (llm is null)

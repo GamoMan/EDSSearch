@@ -25,11 +25,13 @@ public sealed class LlmSummarizer : IDisposable
     public LlmSummarizer(LlmOptions o, ILogger log)
     {
         this.o = o;
-        var cfg = Path.Combine(o.ModelPath, "genai_config.json");
+        OnnxNative.Prepare(log);
+        var dir = AppPaths.Resolve(o.ModelPath);
+        var cfg = Path.Combine(dir, "genai_config.json");
         if (!File.Exists(cfg))
             throw new FileNotFoundException(
-                $"LLM folder not found or incomplete: {Path.GetFullPath(o.ModelPath)} (needs genai_config.json). See models/README.md.");
-        model = new Model(o.ModelPath);
+                $"LLM folder not found or incomplete: {Path.GetFullPath(dir)} (needs genai_config.json). See models/README.md.");
+        model = new Model(dir);
         tok = new Tokenizer(model);
         log.LogInformation("LLM loaded from {Path} (template {Template})", o.ModelPath, o.Template);
     }

@@ -132,6 +132,13 @@ public class FetchOptions
     public int MaxWaitSeconds { get; set; } = 120;    // never wait longer than this for one retry
     public string UserAgent { get; set; } = "EdsSearch-Indexer/1.0";
 }
+// extra rules for text that must not be indexed or shown (the built-in rules already handle section-metadata, paths, GUIDs, style names)
+public class CleaningOptions
+{
+    public string[] ExtraDropClasses { get; set; } = Array.Empty<string>();    // more block class names to remove, e.g. "cookie-banner"
+    public string[] ExtraLinePatterns { get; set; } = Array.Empty<string>();   // regex: a whole line of text that matches is dropped
+    public string[] ExtraRemovePatterns { get; set; } = Array.Empty<string>(); // regex: the matching text is cut out, the rest of the line stays
+}
 public class DemoteRule
 {
     public string PathPattern { get; set; } = "";      // regex on the page path, e.g. "/(news|press)(/|$)"
@@ -162,6 +169,7 @@ public class EdsOptions
     public LlmOptions Llm { get; set; } = new();
     public RankingOptions Ranking { get; set; } = new();
     public FetchOptions Fetch { get; set; } = new();
+    public CleaningOptions Cleaning { get; set; } = new();
 }
 public record UpdateRequest(string[]? Paths, bool Deep = false, string[]? Urls = null);
 public record Entry(string Path, string Title, string Date, string Description, string Image, string Keywords, string Robots, string Content);
@@ -178,6 +186,9 @@ public class SearchService
     readonly OnnxEmbedder? emb;          // null = no vectors: the index is text-only
     readonly LlmSummarizer? llm;         // null = extractive summary only
     readonly List<(Regex re, double factor)> demote;   // pages whose score is lowered (e.g. news)
+    readonly string[] dropClasses;       // page blocks removed before indexing
+    readonly Regex[] extraJunk;          // extra "this line is not content" patterns (Eds:Cleaning)
+    readonly Regex[] extraRemove;        // extra "cut this text out" patterns (Eds:Cleaning)
     readonly ISearchStore store;         // Redis or Azure AI Search (Eds:Store)
     const int BatchSize = 50;            // pages per write to the store
     int n;                               // number of documents (kept up to date by the jobs)
@@ -199,6 +210,11 @@ public class SearchService
         this.o = o; this.http = http; this.log = log; this.conf = conf;
         emb = o.Embedding.Provider.Equals("onnx", StringComparison.OrdinalIgnoreCase)
             ? new OnnxEmbedder(o.Embedding, log) : null;
+        dropClasses = BuiltInDropClasses.Concat(o.Cleaning.ExtraDropClasses).ToArray();
+        extraJunk = o.Cleaning.ExtraLinePatterns.Where(p => p.Length > 0)
+            .Select(p => new Regex(p, RegexOptions.IgnoreCase | RegexOptions.Compiled)).ToArray();
+        extraRemove = o.Cleaning.ExtraRemovePatterns.Where(p => p.Length > 0)
+            .Select(p => new Regex(p, RegexOptions.IgnoreCase | RegexOptions.Compiled)).ToArray();
         demote = o.Ranking.Demote.Where(r => r.PathPattern.Length > 0)
             .Select(r => (new Regex(r.PathPattern, RegexOptions.IgnoreCase | RegexOptions.Compiled), r.Factor)).ToList();
         if (o.Llm.Enabled)
@@ -428,14 +444,93 @@ public class SearchService
         return o.BaseUrl.TrimEnd('/') + p + ".plain.html";
     }
 
-    static string HtmlToText(string html)
+    // parts of an EDS page that are settings, not content: the "section-metadata" table (style, is-subnav-section ...)
+    // zero-width space/joiners, left-to-right / right-to-left marks, soft hyphen, BOM: invisible, never content
+    static readonly Regex Invisible = new(@"[\u200B-\u200F\u202A-\u202E\u2060-\u2064\u00AD\uFEFF]", RegexOptions.Compiled);
+    static readonly string[] BuiltInDropClasses = { "section-metadata", "metadata" };
+    static readonly Regex DivTag = new(@"<(/?)div\b[^>]*>", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    // removes every <div class="...name..."> ... </div> with everything inside (nested divs are counted)
+    static string RemoveBlocks(string html, IEnumerable<string> classNames)
     {
-        html = Regex.Replace(html, @"<(script|style)[\s\S]*?</\1>", " ", RegexOptions.IgnoreCase);
+        foreach (var cls in classNames)
+        {
+            var open = new Regex($@"<div\b[^>]*\bclass\s*=\s*[""'][^""']*\b{Regex.Escape(cls)}\b[^""']*[""'][^>]*>", RegexOptions.IgnoreCase);
+            Match m;
+            while ((m = open.Match(html)).Success)
+            {
+                int depth = 1, end = html.Length;
+                foreach (Match t in DivTag.Matches(html, m.Index + m.Length))
+                {
+                    depth += t.Groups[1].Length == 0 ? 1 : -1;
+                    if (depth == 0) { end = t.Index + t.Length; break; }
+                }
+                html = html.Remove(m.Index, end - m.Index).Insert(m.Index, "\n");
+            }
+        }
+        return html;
+    }
+
+    // page HTML -> readable text: only what a visitor reads. Settings blocks, bare links / paths, ids and
+    // style names (bg-truthful-blue, is-subnav-section false, GUIDs ...) are left out.
+    string HtmlToText(string html)
+    {
+        html = Regex.Replace(html, @"<(script|style|noscript|template)[\s\S]*?</\1>", " ", RegexOptions.IgnoreCase);
+        html = RemoveBlocks(html, dropClasses);
+        html = Regex.Replace(html, @"<a\b[^>]*>\s*(?:https?://[^<\s]+|/[^<\s]*)\s*</a>", " ", RegexOptions.IgnoreCase);   // link whose text is only its address
         html = Regex.Replace(html, @"</(p|div|h[1-6]|li|tr|section|ul|ol|table|blockquote)>|<br\s*/?>", "\n", RegexOptions.IgnoreCase);
         html = Regex.Replace(html, @"<[^>]+>", " ");
         html = Regex.Replace(Decode(html), @"[ \t\r\f\v\u00A0\u2000-\u200A\u202F\u205F\u3000]+", " ");   // incl. &nbsp;
-        html = html.Replace("\u200B", "").Replace("\uFEFF", "");                                         // zero-width characters
-        return Regex.Replace(html, @"\s*\n\s*", "\n").Trim();      // one newline between blocks
+        html = Invisible.Replace(html, "");                                                               // zero-width and direction marks
+        html = Regex.Replace(html, @"\s*\n\s*", "\n").Trim();      // one newline between blocks
+        return string.Join("\n", html.Split('\n').Select(StripSettings).Where(l => l.Length > 0 && !IsJunk(l)));
+    }
+
+    // lines that are not content: a URL or path, a GUID, style / setting names, or (mostly) symbols and numbers
+    static readonly Regex PathLike = new(@"^(https?://\S+|www\.\S+|/[\w\-./%~+@:]+/?)$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    static readonly Regex GuidLike = new(@"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    static readonly Regex ConfigLike = new(@"\b(?:is|has|show|hide)-[a-z0-9]+(?:-[a-z0-9]+)*\b|\bbg-[a-z0-9\-]+|\bfull-bleed[\w\-]*|^\s*(?:style|variant|layout|theme|class|id)\s+[a-z0-9\-, ]+$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    static readonly Regex CssToken = new(@"^[a-z][a-z0-9]*(-[a-z0-9]+)+$", RegexOptions.Compiled);
+
+    // Settings text that is mixed INTO real text (the section-metadata table flattened into one line):
+    //   "is-subnav-section false style bg-truthful-blue, full-bleed-bg <real text> true is-subnav-section false style pad-top-30, ..."
+    // The settings are cut out and the real text stays. Marked with \u0001 first so that a true/false next to a setting goes with it
+    // (a "true" inside a normal sentence is kept).
+    static readonly Regex SettingKey = new(@"\b(?:is|has|show|hide)-[a-z0-9]+(?:-[a-z0-9]+)*\b(?:\s+(?:true|false)(?![\w-]))?", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    static readonly Regex StyleList = new(@"\bstyle\s+(?:[a-z][a-z0-9]*(?:-[a-z0-9]+)+\s*,?\s*)+", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    static readonly Regex StyleName = new(@"(?<![\w-])(?:bg|pad|margin|center|central|underline|full-bleed)(?:-[a-z0-9]+)+,?", RegexOptions.Compiled);
+    static readonly Regex SettingMark = new(@"(?:(?<![\w-])(?:true|false)(?![\w-])\s*)?(?:\u0001\s*)+(?:(?<![\w-])(?:true|false)(?![\w-]))?", RegexOptions.Compiled);
+
+    string StripSettings(string s)
+    {
+        s = SettingKey.Replace(s, "\u0001");
+        s = StyleList.Replace(s, "\u0001");
+        s = StyleName.Replace(s, "\u0001");
+        s = SettingMark.Replace(s, " ");
+        foreach (var r in extraRemove) s = r.Replace(s, " ");
+        return Regex.Replace(s, @"[ \t]{2,}", " ").Trim();
+    }
+
+    // readable one-line text: invisible characters, entities and tags cleaned, settings cut out
+    string Tidy(string? s) => StripSettings(CleanLine(s));
+
+    // content -> one readable line (for the snippet under a result), also for pages indexed before the cleaning existed
+    string ReadableText(string? content) =>
+        string.Join(" ", (content ?? "").Split('\n').Select(Tidy).Where(l => l.Length > 0 && !IsJunk(l)));
+
+    // built-in rules + the patterns from Eds:Cleaning:ExtraLinePatterns
+    bool IsJunk(string s) => IsNoise(s) || extraJunk.Any(r => r.IsMatch(s));
+
+    static bool IsNoise(string s)
+    {
+        s = s.Trim();
+        if (s.Length == 0 || PathLike.IsMatch(s) || s.Contains("/content/") || GuidLike.IsMatch(s) || ConfigLike.IsMatch(s)) return true;
+        int letters = s.Count(char.IsLetter), nonSpace = s.Count(c => !char.IsWhiteSpace(c));
+        if (letters == 0 || (nonSpace >= 15 && letters < nonSpace * 0.5)) return true;
+        // lowercase-with-hyphen words (css class names) make up most of the line
+        var words = s.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        int css = words.Count(w => CssToken.IsMatch(w.Trim(',', ';')));
+        return css >= 2 && css * 2 >= words.Length;
     }
 
     // &quot; &amp;quot; &#39; &nbsp; ... -> real characters. Repeated, because some sources are escaped twice.
@@ -456,7 +551,7 @@ public class SearchService
         if (string.IsNullOrEmpty(s)) return "";
         s = Decode(s);
         s = Regex.Replace(s, @"</?[a-zA-Z][^>]*>", " ");                  // stray html tags
-        s = s.Replace("\u200B", "").Replace("\uFEFF", "");
+        s = Invisible.Replace(s, "");
         return Regex.Replace(s, @"\s+", " ").Trim();                       // \s also matches the non-breaking space
     }
 
@@ -474,7 +569,7 @@ public class SearchService
             log.LogWarning("{Path}: could not be fetched ({Msg}); left unchanged", e.Path, ex.Message);
             return null;
         }
-        string title = CleanLine(e.Title), keywords = CleanLine(e.Keywords), description = CleanLine(e.Description);
+        string title = Tidy(e.Title), keywords = Tidy(e.Keywords), description = Tidy(e.Description);
         var hash = Convert.ToHexString(SHA1.HashData(Encoding.UTF8.GetBytes(
             string.Join("\u0001", title, keywords, description, content))));
         return new Doc(e.Path, title, e.Date, description, e.Image, keywords, content, hash);
@@ -695,11 +790,13 @@ public class SearchService
             fetch, lang);
 
         var hits = store.Search(request)
-            .Select(r => new Hit(r.Path, PublicBase + r.Path, CleanLine(r.Title), CleanLine(r.Description),
+            .Select(r => new Hit(r.Path, PublicBase + r.Path, Tidy(r.Title), NoJunk(Tidy(r.Description)),
                                  null, r.Image, r.Date, Math.Round(r.Score, 4)))
             .ToList();
         return Finish(hits, k);
     }
+
+    string NoJunk(string s) => IsJunk(s) ? "" : s;     // a description that is only settings text is not shown
 
     double DemoteFactor(string path) =>
         demote.Where(r => r.re.IsMatch(path)).Select(r => r.factor).DefaultIfEmpty(1.0).Min();
@@ -713,7 +810,7 @@ public class SearchService
         return hits.Take(k).Select(h =>
         {
             if (!string.IsNullOrWhiteSpace(h.description)) return h;
-            var flat = CleanLine(GetField(h.path!, "content"));
+            var flat = ReadableText(GetField(h.path!, "content"));
             return h with { snippet = flat.Length > 240 ? flat[..240] + "…" : flat };
         }).ToList();
     }
@@ -739,15 +836,15 @@ public class SearchService
 
     static readonly Regex SentSplit = new(@"(?<=[.!?…])\s+|\n+", RegexOptions.Compiled);
 
-    static IEnumerable<string> Sentences(string text)
+    IEnumerable<string> Sentences(string text)
     {
         var seen = new HashSet<string>();
         foreach (var raw in SentSplit.Split(text))
         {
-            var seg = CleanLine(raw);
+            var seg = Tidy(raw);
             if (seg.Length == 0) continue;
             foreach (var piece in CutLong(seg, 220))
-                if (piece.Length >= 25 && seen.Add(piece)) yield return piece;
+                if (piece.Length >= 25 && !IsJunk(piece) && seen.Add(piece)) yield return piece;
         }
     }
 
@@ -776,19 +873,17 @@ public class SearchService
 
     public record ExtractiveSummary(string text, List<SummarySentence> sentences, List<int> sources);
 
-    // best passages for the query from the top pages: sentences, plus page descriptions when `loose`
-    // (descriptions are only context for the LLM - the extractive summary never quotes them)
+    // best passages for the query from the top pages: the page description and sentences of the page content,
+    // nothing else (no paths, links or titles)
     List<Cand> Pick(string q, List<Hit> hits, int max, bool loose)
     {
         var so = o.Summary;
         var cands = new List<Cand>();
         for (int i = 0; i < Math.Min(so.TopDocs, hits.Count); i++)
         {
-            if (loose)
-            {
-                var desc = CleanLine(hits[i].description);
-                if (desc.Length >= 25) cands.Add(new Cand(i, -1, desc));
-            }
+            // candidates are only the page's description and its page content (sentences)
+            var desc = CleanLine(hits[i].description);
+            if (desc.Length >= 25 && !IsJunk(desc)) cands.Add(new Cand(i, -1, desc));
             int pos = 0;
             foreach (var sent in Sentences(GetField(hits[i].path!, "content") ?? "").Take(so.PerDoc))
                 cands.Add(new Cand(i, pos++, sent));
